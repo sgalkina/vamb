@@ -149,26 +149,60 @@ def _count_covered_bases(segment, mean_read_length, reflen, matches):
 
     return matches
 
-def _filter_segments(segmentiterator, minscore, minid):
-    """Returns an iterator of (AlignedSegment, matches) filtered for reads with
-    low alignment score.
-    """
+    return False
 
-    for alignedsegment in segmentiterator:
-        # Skip if unaligned or suppl. aligment
-        if alignedsegment.flag & 0x804 != 0:
-            continue
+def _is_skippable(segment, minscore, identity, minid):
+    "Return whether this segment should be ignored when calculating depth"
+    # Skip if unaligned or suppl. aligment
+    if segment.flag & 0x804 != 0:
+        return True
 
-        if minscore is not None and alignedsegment.get_tag('AS') < minscore:
-            continue
+    elif minscore is not None and alignedsegment.get_tag('AS') < minscore:
+        return True
 
-        matches, mismatches, total = _matches_mismatches(alignedsegment)
+    if minid is not None and identity < minid:
+        return True
+
+    return False
+
+def _group_segments(segmentiterator, minscore, minid):
+    """Returns an iterator of ([(segment, matches) ...], nreads), such that nreads
+    counts all distinct reads in the file, and each returned list comprises
+    all the segments from a single read, as well as the matches."""
+    readcount = 0
+    buffer = list()
+
+    try:
+        segment = next(segmentiterator)
+        old_read = (segment.is_reverse, segment.query_name)
+        readcount += 1
+        matches, mismatches, total = _matches_mismatches(segment)
         identity = matches / (matches + total)
+        if not _is_skippable(segment, minscore, identity, minid):
+            buffer.append((segment, matches))
 
-        if minid is not None and identity < minid:
-            continue
+    except StopIteration:
+        raise StopIteration from None
 
-        yield (alignedsegment, matches + mismatches)
+    for segment in segmentiterator:
+        read = (segment.is_reverse, segment.query_name)
+        if read != old_read:
+            readcount += 1
+
+            if len(buffer) != 0:
+                yield (buffer, readcount)
+                buffer = list()
+
+            read = old_read
+
+        matches, mismatches, total = _matches_mismatches(segment)
+        identity = matches / (matches + total)
+        if not _is_skippable(segment, minscore, identity, minid):
+            buffer.append((segment, matches))
+
+    # Final read
+    if len(buffer) != 0:
+        yield (buffer, readcount)
 
 def _calc_covered_bases(bamfile, mean_read_length, minscore=None, minid=None):
     """Count number of reads mapping to each reference in a bamfile,
@@ -189,47 +223,15 @@ def _calc_covered_bases(bamfile, mean_read_length, minscore=None, minid=None):
     # Use 64-bit floats for better precision when counting
     lengths = bamfile.lengths
     depths = _np.zeros(len(lengths))
-    filtered_segments = _filter_segments(bamfile, minscore, minid)
+    nreads = 0
 
-    # Initialize variabæes with first aligned read - return immediately if
-    # the file is empty
-    try:
-        (segment, matches) = next(filtered_segments)
-        multimap = 1.0
-        readcount = 1
-        reference_ids = [segment.reference_id]
-        reference_depths = [_count_covered_bases(segment, mean_read_length, lengths[segment.reference_id], matches)]
-        old_read_identity = (segment.is_reverse, segment.query_name)
-    except StopIteration:
-        return depths.astype(_np.float32), 0
+    for segments, nreads in _group_segments(bamfile, minscore, minid):
+        fraction = 1.0 / len(segments)
+        for (segment, matches) in segments:
+            bases = _count_covered_bases(segment, mean_read_length, lengths[segment.reference_id], matches)
+            depths[segment.reference_id] += bases * fraction
 
-    # Now count up each read in the BAM file
-    for (segment, matches) in filtered_segments:
-        read_identity = (segment.is_reverse, segment.query_name)
-
-        # If we reach a new read, we tally up the previous read's depths
-        # towards all its references, split evenly.
-        if read_identity != old_read_identity:
-            readcount += 1
-            fraction = 1.0 / multimap
-            for (reference_id, depth) in zip(reference_ids, reference_depths):
-                depths[reference_id] += depth * fraction
-
-            reference_ids.clear()
-            reference_depths.clear()
-            multimap = 0.0
-            old_read_identity = read_identity
-
-        multimap += 1.0
-        reference_ids.append(segment.reference_id)
-        reference_depths.append(_count_covered_bases(segment, mean_read_length, lengths[segment.reference_id], matches))
-
-    # Add the final read
-    fraction = 1.0 / multimap
-    for (reference_id, depth) in zip(reference_ids, reference_depths):
-        depths[reference_id] += depth * fraction
-
-    return depths.astype(_np.float32), readcount
+    return depths.astype(_np.float32), nreads
 
 def calc_adjusted_depths(bases, lengths, readcount, mean_read_length, minlength=151):
     """Calculate depths adjusted by number of reads and seq lengths
@@ -255,10 +257,10 @@ def calc_adjusted_depths(bases, lengths, readcount, mean_read_length, minlength=
     lengtharray[lengtharray > (2*mean_read_length)] -= (2*mean_read_length) # prevent division by zero
     adjusted_depths = (bases / lengtharray).astype(_np.float32)
 
-    # Scale with thousand reads, since depth is a linear function of total number
+    # Scale with million reads, since depth is a linear function of total number
     # of reads.
     if readcount > 0:
-        adjusted_depths *= (1000 / readcount)
+        adjusted_depths *= (1000000 / readcount)
 
     # Now filter away small contigs
     adjusted_depths = adjusted_depths[lengtharray >= minlength]
