@@ -85,22 +85,60 @@ def mergecolumns(pathlist):
 
     return result
 
-def _identity(segment):
-    "Return the nucleotide identity of the given aligned segment."
-    mismatches, matches = 0, 0
-    for kind, number in segment.cigartuples:
-        # 0, 7, 8, is match/mismatch, match, mismatch, respectively
-        if kind in (0, 7, 8):
-            matches += number
-        # 1, 2 is insersion, deletion
-        elif kind in (1, 2):
-            mismatches += number
-    matches -= segment.get_tag('NM')
-    return matches / (matches+mismatches)
+def _matches_mismatches(segment):
+    """Return (matches, mismatches) of the given aligned segment.
+    Insertions/deletions counts as mismatches."""
+    either, matches, mismatches = 0, 0, 0
+    for (operation, n) in segment.cigartuples:
+        if operation == 0:
+            either += n
+        elif operation == 7:
+            matches += n
+        # 1, 2, 8 is insertion, deletion, mismatch
+        elif operation in (1, 2, 8):
+            mismatches += n
+
+    # This is the number of mismatches in matches/mismatches operation
+    extra_mismatches = segment.get_tag('NM')
+    matches = matches + (either - extra_mismatches)
+    mismatches = mismatches + extra_mismatches
+    return matches, mismatches
+
+def _count_relevant_bases(segment, reflen, matches):
+    "Counts all matches not within the first or last 75 bp of the reference."
+    start = segment.reference_start
+    end = segment.reference_end
+
+    # If the read does not overlap with the ends, just return all matches
+    # in read, this is simpler and faster
+    if start > 74 and end < reflen-75:
+        return matches
+
+    matches = 0
+    pos = start
+    started = False
+
+    # Else count all matches that does not overlap with the ends. BAM files report
+    # the "starting" position as the start of the alignment proper, and so we must
+    # skip every cigar operation that does not consume reference bases, otherwise
+    # the "pos" variable will be wrong.
+    for (kind, n) in segment.cigartuples:
+        if not started:
+            if kind in (1, 4, 5, 6): # insertion, soft clip, hard clip, padding
+                continue
+            else:
+                started = True
+
+        # Actual matching operations, discard first and last 75 bp of reference
+        if kind in (0, 7):
+            matches += max(0, min((pos+n), reflen-75) - max(pos, 75))
+        pos += n
+
+    return matches
 
 def _filter_segments(segmentiterator, minscore, minid):
-    """Returns an iterator of AlignedSegment filtered for reads with low
-    alignment score.
+    """Returns an iterator of (AlignedSegment, matches) filtered for reads with
+    low alignment score.
     """
 
     for alignedsegment in segmentiterator:
@@ -111,12 +149,15 @@ def _filter_segments(segmentiterator, minscore, minid):
         if minscore is not None and alignedsegment.get_tag('AS') < minscore:
             continue
 
-        if minid is not None and _identity(alignedsegment) < minid:
+        matches, mismatches = _matches_mismatches(alignedsegment)
+        identity = matches / (matches + mismatches)
+
+        if minid is not None and identity < minid:
             continue
 
-        yield alignedsegment
+        yield (alignedsegment, matches)
 
-def count_reads(bamfile, minscore=None, minid=None):
+def calc_coverage(bamfile, minscore=None, minid=None):
     """Count number of reads mapping to each reference in a bamfile,
     optionally filtering for score and minimum id.
     Multi-mapping reads MUST be consecutive in file, and their counts are
@@ -130,70 +171,66 @@ def count_reads(bamfile, minscore=None, minid=None):
     Output: Float32 Numpy array of read counts for each reference in file.
     """
     # Use 64-bit floats for better precision when counting
-    readcounts = _np.zeros(len(bamfile.lengths))
+    lengths = bamfile.lengths
+    coverages = _np.zeros(len(lengths))
 
     # Initialize with first aligned read - return immediately if the file
     # is empty
     filtered_segments = _filter_segments(bamfile, minscore, minid)
     try:
-        segment = next(filtered_segments)
-        read_name = segment.query_name
+        (oldsegment, oldmatches) = next(filtered_segments)
         multimap = 1.0
         reference_ids = [segment.reference_id]
     except StopIteration:
-        return readcounts.astype(_np.float32)
+        return coverages.astype(_np.float32)
 
     # Now count up each read in the BAM file
-    for segment in filtered_segments:
+    for (segment, matches) in filtered_segments:
         # If we reach a new read_name, we tally up the previous read
         # towards all its references, split evenly.
-        if segment.query_name != read_name:
-            read_name = segment.query_name
-            to_add = 1.0 / multimap
+        if (segment.is_reverse is not oldsegment.is_reverse) or (segment.query_name != oldsegment.query_name):
+            fraction = 1.0 / multimap
             for reference_id in reference_ids:
-                readcounts[reference_id] += to_add
+                counted_matches = _count_relevant_bases(oldsegment, lengths[reference_id], oldmatches)
+                coverages[reference_id] += counted_matches * fraction
             reference_ids.clear()
             multimap = 0.0
+            oldsegment = segment
+            oldmatches = matches
 
         multimap += 1.0
         reference_ids.append(segment.reference_id)
 
     # Add final read
-    to_add = 1.0 / multimap
+    fraction = 1.0 / multimap
     for reference_id in reference_ids:
-        readcounts[reference_id] += to_add
+        counted_matches = _count_relevant_bases(oldsegment, lengths[reference_id], oldmatches)
+        coverages[reference_id] += counted_matches * fraction
 
-    return readcounts.astype(_np.float32)
+    return coverages.astype(_np.float32)
 
-def calc_rpkm(counts, lengths, minlength=None):
+def calc_adjusted_coverage(coverages, lengths, minlength=None):
     """Calculate RPKM based on read counts and sequence lengths.
 
     Inputs:
-        counts: Numpy vector of read counts from count_reads
+        coverages: Numpy vector from calc_coverage
         lengths: Iterable of contig lengths in same order as counts
         minlength [None]: Discard any references shorter than N bases
 
     Output: Float32 Numpy vector of RPKM for all seqs with length >= minlength
     """
-    lengtharray = _np.array(lengths)
-    if len(counts) != len(lengtharray):
-        raise ValueError("counts length and lengths length must be same")
+    lengtharray = _np.array(lengths) - 150
+    if len(coverages) != len(lengtharray):
+        raise ValueError("coverages length and lengths length must be same")
 
-    millionmappedreads = counts.sum() / 1e6
-
-    # Prevent division by zero
-    if millionmappedreads == 0:
-        rpkm = _np.zeros(len(lengtharray), dtype=_np.float32)
-    else:
-        kilobases = lengtharray / 1000
-        rpkm = (counts / (kilobases * millionmappedreads)).astype(_np.float32)
+    adjusted_coverage = (coverages / lengtharray).astype(_np.float32)
 
     # Now filter away small contigs
     if minlength is not None:
         lengthmask = lengtharray >= minlength
-        rpkm = rpkm[lengthmask]
+        adjusted_coverage = adjusted_coverage[lengthmask]
 
-    return rpkm
+    return adjusted_coverage
 
 def _hash_refnames(refnames):
     "Hashes an iterable of strings of reference names using MD5."
@@ -251,20 +288,20 @@ def _get_contig_rpkms(inpath, outpath, refhash, minscore, minlength, minid):
 
     bamfile = _pysam.AlignmentFile(inpath, "rb")
     _check_bamfile(inpath, bamfile, refhash, minlength)
-    counts = count_reads(bamfile, minscore, minid)
-    rpkms = calc_rpkm(counts, bamfile.lengths, minlength)
+    coverages = calc_coverage(bamfile, minscore, minid)
+    adjusted_coverage = calc_adjusted_coverage(coverages, bamfile.lengths, minlength)
     bamfile.close()
 
     # If dump to disk, array returned is None instead of rpkm array
     if outpath is not None:
         arrayresult = None
-        _np.savez_compressed(outpath, rpkms)
+        _np.savez_compressed(outpath, adjusted_coverage)
     else:
-        arrayresult = rpkms
+        arrayresult = adjusted_coverage
 
-    return inpath, arrayresult, len(rpkms)
+    return inpath, arrayresult, len(adjusted_coverage)
 
-def read_bamfiles(paths, dumpdirectory=None, refhash=None, minscore=None, minlength=None,
+def read_bamfiles(paths, dumpdirectory=None, refhash=None, minscore=None, minlength=200,
                   minid=None, subprocesses=DEFAULT_SUBPROCESSES, logfile=None):
     "Placeholder docstring - replaced after this func definition"
 
@@ -374,7 +411,7 @@ Input:
     dumpdirectory: [None] Dir to create and dump per-sample depths NPZ files to
     refhash: [None]: Check all BAM references md5-hash to this (None = no check)
     minscore [None]: Minimum alignment score (AS field) to consider
-    minlength [None]: Ignore any references shorter than N bases
+    minlength [200]: Ignore any references shorter than N bases
     minid [None]: Discard any reads with nucleotide identity less than this
     subprocesses [{}]: Number of subprocesses to spawn
     logfile: [None] File to print progress to

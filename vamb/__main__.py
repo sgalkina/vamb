@@ -306,12 +306,12 @@ def main():
     # Optional arguments
     inputos = parser.add_argument_group(title='IO options', description=None)
 
-    inputos.add_argument('-m', dest='minlength', metavar='', type=int, default=100,
-                         help='ignore contigs shorter than this [100]')
+    inputos.add_argument('-m', dest='minlength', metavar='', type=int, default=1500,
+                         help='ignore contigs shorter than this [1500]')
     inputos.add_argument('-s', dest='minascore', metavar='', type=int, default=None,
                          help='ignore reads with alignment score below this [None]')
-    inputos.add_argument('-z', dest='minid', metavar='', type=float, default=None,
-                         help='ignore reads with nucleotide identity below this [None]')
+    inputos.add_argument('-z', dest='minid', metavar='', type=float, default=0.97,
+                         help='ignore reads with nucleotide identity below this [0.97]')
     inputos.add_argument('-p', dest='subprocesses', metavar='', type=int, default=DEFAULT_PROCESSES,
                          help=('number of subprocesses to spawn '
                               '[min(' + str(DEFAULT_PROCESSES) + ', nbamfiles)]'))
