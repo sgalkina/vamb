@@ -85,33 +85,46 @@ def mergecolumns(pathlist):
 
     return result
 
+def _mean_read_length(file, N, default=100):
+    "Get mean read length of first N reads of alignment file"
+    lengths = list()
+    for segment in file:
+        if len(lengths) == N:
+            break
+
+        qlen = segment.infer_query_length()
+        if qlen is not None:
+            lengths.append(qlen)
+
+    if len(lengths) == 0:
+        mean_length = default
+    else:
+        mean_length = min(int(sum(lengths) / len(lengths)), default)
+
+    file.reset()
+    return mean_length
+
 def _matches_mismatches(segment):
-    """Return (matches, mismatches) of the given aligned segment.
-    Insertions/deletions counts as mismatches."""
-    either, matches, mismatches = 0, 0, 0
+    """Return (matches, mismatches, total_mm) of the given aligned segment.
+    Insertions/deletions counts as mismatches. total_mm includes ins/del"""
+    matches, other = 0, 0
     for (operation, n) in segment.cigartuples:
-        if operation == 0:
-            either += n
-        elif operation == 7:
+        if operation in (0, 7, 8): # mm / matchers / mismatches
             matches += n
-        # 1, 2, 8 is insertion, deletion, mismatch
-        elif operation in (1, 2, 8):
-            mismatches += n
+        elif operation in (1, 2): # insertion/deletion
+            other += n
 
-    # This is the number of mismatches in matches/mismatches operation
-    extra_mismatches = segment.get_tag('NM')
-    matches = matches + (either - extra_mismatches)
-    mismatches = mismatches + extra_mismatches
-    return matches, mismatches
+    mismatches = segment.get_tag('NM')
+    return matches - mismatches, mismatches, other + mismatches
 
-def _count_relevant_bases(segment, reflen, matches):
-    "Counts all matches not within the first or last 75 bp of the reference."
+def _count_covered_bases(segment, mean_read_length, reflen, matches):
+    "Counts all matches/mm not within the first or last 75 bp of the reference."
     start = segment.reference_start
     end = segment.reference_end
 
     # If the read does not overlap with the ends, just return all matches
     # in read, this is simpler and faster
-    if start > 74 and end < reflen-75:
+    if start >= mean_read_length and end < reflen - mean_read_length:
         return matches
 
     matches = 0
@@ -130,8 +143,8 @@ def _count_relevant_bases(segment, reflen, matches):
                 started = True
 
         # Actual matching operations, discard first and last 75 bp of reference
-        if kind in (0, 7):
-            matches += max(0, min((pos+n), reflen-75) - max(pos, 75))
+        if kind in (0, 7, 8):
+            matches += max(0, min((pos+n), reflen-mean_read_length) - max(pos, mean_read_length))
         pos += n
 
     return matches
@@ -149,15 +162,15 @@ def _filter_segments(segmentiterator, minscore, minid):
         if minscore is not None and alignedsegment.get_tag('AS') < minscore:
             continue
 
-        matches, mismatches = _matches_mismatches(alignedsegment)
-        identity = matches / (matches + mismatches)
+        matches, mismatches, total = _matches_mismatches(alignedsegment)
+        identity = matches / (matches + total)
 
         if minid is not None and identity < minid:
             continue
 
-        yield (alignedsegment, matches)
+        yield (alignedsegment, matches + mismatches)
 
-def calc_coverage(bamfile, minscore=None, minid=None):
+def _calc_covered_bases(bamfile, mean_read_length, minscore=None, minid=None):
     """Count number of reads mapping to each reference in a bamfile,
     optionally filtering for score and minimum id.
     Multi-mapping reads MUST be consecutive in file, and their counts are
@@ -165,72 +178,92 @@ def calc_coverage(bamfile, minscore=None, minid=None):
 
     Inputs:
         bamfile: Open pysam.AlignmentFile
+        mean_read_length: Mean read length of file
         minscore: Minimum alignment score (AS field) to consider [None]
         minid: Discard any reads with ID lower than this [None]
 
-    Output: Float32 Numpy array of read counts for each reference in file.
+    Output:
+        depths: Float32 Numpy array of read counts for each reference in file.
+        readcount: Number of distinct mapped reads
     """
     # Use 64-bit floats for better precision when counting
     lengths = bamfile.lengths
-    coverages = _np.zeros(len(lengths))
-
-    # Initialize with first aligned read - return immediately if the file
-    # is empty
+    depths = _np.zeros(len(lengths))
     filtered_segments = _filter_segments(bamfile, minscore, minid)
+
+    # Initialize variabæes with first aligned read - return immediately if
+    # the file is empty
     try:
-        (oldsegment, oldmatches) = next(filtered_segments)
+        (segment, matches) = next(filtered_segments)
         multimap = 1.0
+        readcount = 1
         reference_ids = [segment.reference_id]
+        reference_depths = [_count_covered_bases(segment, mean_read_length, lengths[segment.reference_id], matches)]
+        old_read_identity = (segment.is_reverse, segment.query_name)
     except StopIteration:
-        return coverages.astype(_np.float32)
+        return depths.astype(_np.float32), 0
 
     # Now count up each read in the BAM file
     for (segment, matches) in filtered_segments:
-        # If we reach a new read_name, we tally up the previous read
+        read_identity = (segment.is_reverse, segment.query_name)
+
+        # If we reach a new read, we tally up the previous read's depths
         # towards all its references, split evenly.
-        if (segment.is_reverse is not oldsegment.is_reverse) or (segment.query_name != oldsegment.query_name):
+        if read_identity != old_read_identity:
+            readcount += 1
             fraction = 1.0 / multimap
-            for reference_id in reference_ids:
-                counted_matches = _count_relevant_bases(oldsegment, lengths[reference_id], oldmatches)
-                coverages[reference_id] += counted_matches * fraction
+            for (reference_id, depth) in zip(reference_ids, reference_depths):
+                depths[reference_id] += depth * fraction
+
             reference_ids.clear()
+            reference_depths.clear()
             multimap = 0.0
-            oldsegment = segment
-            oldmatches = matches
+            old_read_identity = read_identity
 
         multimap += 1.0
         reference_ids.append(segment.reference_id)
+        reference_depths.append(_count_covered_bases(segment, mean_read_length, lengths[segment.reference_id], matches))
 
-    # Add final read
+    # Add the final read
     fraction = 1.0 / multimap
-    for reference_id in reference_ids:
-        counted_matches = _count_relevant_bases(oldsegment, lengths[reference_id], oldmatches)
-        coverages[reference_id] += counted_matches * fraction
+    for (reference_id, depth) in zip(reference_ids, reference_depths):
+        depths[reference_id] += depth * fraction
 
-    return coverages.astype(_np.float32)
+    return depths.astype(_np.float32), readcount
 
-def calc_adjusted_coverage(coverages, lengths, minlength=None):
-    """Calculate RPKM based on read counts and sequence lengths.
+def calc_adjusted_depths(bases, lengths, readcount, mean_read_length, minlength=151):
+    """Calculate depths adjusted by number of reads and seq lengths
 
     Inputs:
-        coverages: Numpy vector from calc_coverage
+        bases: Numpy vector from _calc_covered_bases
         lengths: Iterable of contig lengths in same order as counts
-        minlength [None]: Discard any references shorter than N bases
+        readcount: Number of mapped reads in total
+        mean_read_length: Read length average
+        minlength [151]: Discard any references shorter than N bases
 
     Output: Float32 Numpy vector of RPKM for all seqs with length >= minlength
     """
-    lengtharray = _np.array(lengths) - 150
-    if len(coverages) != len(lengtharray):
-        raise ValueError("coverages length and lengths length must be same")
+    if len(bases) != len(lengths):
+        raise ValueError("bases length and lengths length must be same")
 
-    adjusted_coverage = (coverages / lengtharray).astype(_np.float32)
+    if minlength is not None and minlength <= mean_read_length:
+        raise ValueError("Minlength must be larger than mean read length")
+
+    # Compensate for one mean read length of each end where reads don't align properly,
+    # we don't count depth at these positions
+    lengtharray =  _np.array(lengths)
+    lengtharray[lengtharray > (2*mean_read_length)] -= (2*mean_read_length) # prevent division by zero
+    adjusted_depths = (bases / lengtharray).astype(_np.float32)
+
+    # Scale with thousand reads, since depth is a linear function of total number
+    # of reads.
+    if readcount > 0:
+        adjusted_depths *= (1000 / readcount)
 
     # Now filter away small contigs
-    if minlength is not None:
-        lengthmask = lengtharray >= minlength
-        adjusted_coverage = adjusted_coverage[lengthmask]
+    adjusted_depths = adjusted_depths[lengtharray >= minlength]
 
-    return adjusted_coverage
+    return adjusted_depths
 
 def _hash_refnames(refnames):
     "Hashes an iterable of strings of reference names using MD5."
@@ -288,18 +321,19 @@ def _get_contig_rpkms(inpath, outpath, refhash, minscore, minlength, minid):
 
     bamfile = _pysam.AlignmentFile(inpath, "rb")
     _check_bamfile(inpath, bamfile, refhash, minlength)
-    coverages = calc_coverage(bamfile, minscore, minid)
-    adjusted_coverage = calc_adjusted_coverage(coverages, bamfile.lengths, minlength)
+    mean_read_length = _mean_read_length(bamfile, 1000)
+    bases, readcount = _calc_covered_bases(bamfile, mean_read_length, minscore, minid)
+    adjusted_depths = calc_adjusted_depths(bases, bamfile.lengths, readcount, mean_read_length, minlength)
     bamfile.close()
 
     # If dump to disk, array returned is None instead of rpkm array
     if outpath is not None:
         arrayresult = None
-        _np.savez_compressed(outpath, adjusted_coverage)
+        _np.savez_compressed(outpath, adjusted_depths)
     else:
-        arrayresult = adjusted_coverage
+        arrayresult = adjusted_depths
 
-    return inpath, arrayresult, len(adjusted_coverage)
+    return inpath, arrayresult, len(adjusted_depths)
 
 def read_bamfiles(paths, dumpdirectory=None, refhash=None, minscore=None, minlength=200,
                   minid=None, subprocesses=DEFAULT_SUBPROCESSES, logfile=None):
