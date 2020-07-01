@@ -1,6 +1,4 @@
-# This script calculates RPKM, when paired end reads are mapped to a contig
-# catalogue with BWA MEM. It will not be accurate with single end reads or
-# any other mapper than BWA MEM.
+# This script calculates abundances of contigs in BAM files.
 
 # Theory:
 # We want a simple way to estimate abundance of redundant contig catalogues.
@@ -8,33 +6,21 @@
 # both depth and kmer composition are only stable for longer contigs, we have
 # moved to contig catalogues. We have not found a way of deduplicating contigs.
 
-# For this we have until now used two methods:
-# 1) Only counting the primary hits. In this case the read will never be
-# assigned to any contig which differ by just 1 basepair. Even for
-# identical contigs, reads are assigned randomly which causes noise.
-
-# 2) Using MetaBAT's jgi_summarize_bam_contig_depths, a script which is not
-# documented and we cannot figure out how works. When testing with small
-# toy data, it produces absurd results.
-
-# This script is an attempt to take an approach as simple as possible while
-# still being sound technically. We simply count the number of reads in a
-# contig normalized by contig length and total number of reads.
+# Earlier versions simply counted the number of reads per reference, but we
+# found that was not accurate enough, presumably because aligners have a hard time
+# properly aligning to end of contigs.
+# This script calculates the mean depth across contigs, excluding one read length
+# (though max 100 bp) of each end. It normalizes by contig length, number of reads,
+# and mean read length.
 
 # We look at all hits, including secondary hits. We do not discount partial
 # alignments. Also, if a read maps to N contigs, we count each hit as 1/N reads.
 # The reason for all these decisions is that if the aligner believes it's a hit,
 # we believe the contig is present.
+# We count each read independently, because some algners assigns mating reads
+# to different contigs independently
 
-# We do not take varying insert sizes into account. It is unlikely that
-# any contig with enough reads to provide a reliable estimate of depth would,
-# by chance, only recruit read pairs with short or long insert size. So this
-# will average out over all contigs.
-
-# We count each read independently, because BWA MEM often assigns mating reads
-# to different contigs..
-
-__doc__ = """Estimate RPKM (depths) from BAM files of reads mapped to contigs.
+__doc__ = """Estimate abundances from BAM files of reads mapped to contigs.
 
 Usage:
 >>> bampaths = ['/path/to/bam1.bam', '/path/to/bam2.bam', '/path/to/bam3.bam']
@@ -86,23 +72,24 @@ def mergecolumns(pathlist):
     return result
 
 def _mean_read_length(file, N, default=100):
-    "Get mean read length of first N reads of alignment file"
+    "Get (mean read length, edge_adjustment) of first N reads of alignment file"
     lengths = list()
     for segment in file:
         if len(lengths) == N:
             break
 
         qlen = segment.infer_query_length()
+        # This can happen if there is no CIGAR
         if qlen is not None:
             lengths.append(qlen)
 
     if len(lengths) == 0:
         mean_length = default
     else:
-        mean_length = min(int(sum(lengths) / len(lengths)), default)
+        mean_length = int(sum(lengths) / len(lengths))
 
-    file.reset()
-    return mean_length
+    file.reset() # go back to beginning of file
+    return mean_length, min(mean_length, 100)
 
 def _matches_mismatches(segment):
     """Return (matches, mismatches, total_mm) of the given aligned segment.
@@ -233,7 +220,7 @@ def _calc_covered_bases(bamfile, mean_read_length, minscore=None, minid=None):
 
     return depths.astype(_np.float32), nreads
 
-def calc_adjusted_depths(bases, lengths, readcount, mean_read_length, minlength=151):
+def calc_adjusted_depths(bases, lengths, readcount, mean_read_length, edge_adjustment, minlength=151):
     """Calculate depths adjusted by number of reads and seq lengths
 
     Inputs:
@@ -248,19 +235,21 @@ def calc_adjusted_depths(bases, lengths, readcount, mean_read_length, minlength=
     if len(bases) != len(lengths):
         raise ValueError("bases length and lengths length must be same")
 
-    if minlength is not None and minlength <= mean_read_length:
-        raise ValueError("Minlength must be larger than mean read length")
+    if minlength is not None and minlength <= edge_adjustment:
+        raise ValueError("Minlength must be larger than edge adjustment")
 
     # Compensate for one mean read length of each end where reads don't align properly,
     # we don't count depth at these positions
     lengtharray =  _np.array(lengths)
-    lengtharray[lengtharray > (2*mean_read_length)] -= (2*mean_read_length) # prevent division by zero
+    lengtharray[lengtharray > (2*edge_adjustment)] -= (2*edge_adjustment) # prevent division by zero
+
     adjusted_depths = (bases / lengtharray).astype(_np.float32)
 
     # Scale with million reads, since depth is a linear function of total number
-    # of reads.
+    # of reads. Also scale with read length to compare samples with differing
+    # read lengths.
     if readcount > 0:
-        adjusted_depths *= (1000000 / readcount)
+        adjusted_depths *= 1000000 / (readcount * mean_read_length)
 
     # Now filter away small contigs
     adjusted_depths = adjusted_depths[lengtharray >= minlength]
@@ -323,9 +312,10 @@ def _get_contig_rpkms(inpath, outpath, refhash, minscore, minlength, minid):
 
     bamfile = _pysam.AlignmentFile(inpath, "rb")
     _check_bamfile(inpath, bamfile, refhash, minlength)
-    mean_read_length = _mean_read_length(bamfile, 1000)
-    bases, readcount = _calc_covered_bases(bamfile, mean_read_length, minscore, minid)
-    adjusted_depths = calc_adjusted_depths(bases, bamfile.lengths, readcount, mean_read_length, minlength)
+    mean_read_length, edge_adjustment = _mean_read_length(bamfile, 1000)
+    bases, readcount = _calc_covered_bases(bamfile, edge_adjustment, minscore, minid)
+    adjusted_depths = calc_adjusted_depths(bases, bamfile.lengths, readcount,
+                      mean_read_length, edge_adjustment, minlength)
     bamfile.close()
 
     # If dump to disk, array returned is None instead of rpkm array
