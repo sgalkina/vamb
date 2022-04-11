@@ -150,41 +150,47 @@ def get_samplers(N_data, no_labels_share, index_start=0):
     valid_idx_y = [i for i in valid_idx_x]
     _np.random.shuffle(valid_idx_y)
     print(len(train_idx), len(valid_idx_x))
-    unsupervised_sampler_x = _SubsetRandomSampler(valid_idx_x)
-    unsupervised_sampler_y = _SubsetRandomSampler(valid_idx_y)
-    supervised_sampler = _SubsetRandomSampler(train_idx)
+    unsupervised_sampler_x = valid_idx_x
+    unsupervised_sampler_y = valid_idx_y
+    supervised_sampler = train_idx
     return unsupervised_sampler_x, unsupervised_sampler_y, supervised_sampler
 
-#TODO: an ugly way, make a better one
-def make_dataloader_semisupervised(rpkm, tnf, labels, supervision_level, batchsize=256, destroy=False, cuda=False):
+#TODO: refactor
+def make_dataloader_semisupervised_random(rpkm, tnf, labels, supervision_level, batchsize=256, destroy=False, cuda=False):
     N_data = len(rpkm)
-    unsupervised_sampler_x, unsupervised_sampler_y, supervised_sampler = get_samplers(N_data, 1 - supervision_level)
+    index_x, index_y, index_sup = get_samplers(N_data, 1 - supervision_level)
     depthstensor, tnftensor, batchsize, n_workers, cuda, mask = _make_dataset(rpkm, tnf, batchsize=batchsize, destroy=destroy, cuda=cuda)
     labels_int = _np.unique(labels, return_inverse=True)[1]
     one_hot_labels = F.one_hot(_torch.as_tensor(labels_int)).float()
 
-    dataset_vamb = _TensorDataset(depthstensor, tnftensor)
+    dataset_vamb = _TensorDataset(depthstensor[index_x], tnftensor[index_x])
     dataloader_vamb = _DataLoader(dataset=dataset_vamb, batch_size=batchsize, drop_last=True,
-                            sampler=unsupervised_sampler_x, num_workers=n_workers, pin_memory=cuda)
+                            shuffle=True, num_workers=n_workers, pin_memory=cuda)
 
-    dataset_labels = _TensorDataset(one_hot_labels)
+    dataset_labels = _TensorDataset(one_hot_labels[index_y])
     dataloader_labels = _DataLoader(dataset=dataset_labels, batch_size=batchsize, drop_last=True,
-                            sampler=unsupervised_sampler_y, num_workers=n_workers, pin_memory=cuda)
+                            shuffle=True, num_workers=n_workers, pin_memory=cuda)
 
-    dataset_joint = _TensorDataset(depthstensor, tnftensor, one_hot_labels)
+    dataset_joint = _TensorDataset(depthstensor[index_sup], tnftensor[index_sup], one_hot_labels[index_sup])
     dataloader_joint = _DataLoader(dataset=dataset_joint, batch_size=batchsize, drop_last=True,
-                            sampler=supervised_sampler, num_workers=n_workers, pin_memory=cuda)
-    
+                            shuffle=True, num_workers=n_workers, pin_memory=cuda)
+    indices_all = (index_x, index_y, index_sup)
+    return dataloader_joint, dataloader_vamb, dataloader_labels, mask, indices_all
+
+
+def make_dataloader_semisupervised(dataloader_joint, dataloader_vamb, dataloader_labels, shapes, batchsize=256, destroy=False, cuda=False):
     train_xy_iterator = dataloader_joint.__iter__()
     train_x_iterator = dataloader_vamb.__iter__()
     train_y_iterator = dataloader_labels.__iter__()
 
-    d_all = _torch.zeros((1, depthstensor.shape[1]))
-    d_u_all = _torch.zeros((1, depthstensor.shape[1]))
-    t_all = _torch.zeros((1, tnftensor.shape[1]))
-    t_u_all = _torch.zeros((1, tnftensor.shape[1]))
-    l_all = _torch.zeros((1, one_hot_labels.shape[1]))
-    l_u_all = _torch.zeros((1, one_hot_labels.shape[1]))
+    ds, ts, ls = shapes
+
+    d_all = _torch.zeros((1, ds))
+    d_u_all = _torch.zeros((1, ds))
+    t_all = _torch.zeros((1, ts))
+    t_u_all = _torch.zeros((1, ts))
+    l_all = _torch.zeros((1, ls))
+    l_u_all = _torch.zeros((1, ls))
 
     for i in range(len(dataloader_labels)):
         try:
@@ -215,8 +221,8 @@ def make_dataloader_semisupervised(rpkm, tnf, labels, supervision_level, batchsi
     dataset_all = _TensorDataset(d_all[1:, :], t_all[1:, :], l_all[1:, :], d_u_all[1:, :], t_u_all[1:, :], l_u_all[1:, :])
     print(d_all.shape)
     dataloader_all = _DataLoader(dataset=dataset_all, batch_size=batchsize, drop_last=True,
-                        shuffle=False, num_workers=n_workers, pin_memory=cuda)
-    return dataloader_all, mask
+                        shuffle=True, num_workers=dataloader_joint.num_workers, pin_memory=cuda)
+    return dataloader_all
 
 
 class VAE(_nn.Module):
@@ -685,7 +691,8 @@ class VAEConcat(VAE):
             ce = (depths_out - depths_in).pow(2).sum(dim=1).mean()
             ce_weight = 1 - self.alpha
 
-        ce_labels = _nn.CrossEntropyLoss()(labels_in, labels_out)
+        _, labels_in_indices = labels_in.max(dim=1)
+        ce_labels = _nn.CrossEntropyLoss()(labels_out, labels_in_indices)
         ce_labels_weight = 1. #TODO: figure out
         sse = (tnf_out - tnf_in).pow(2).sum(dim=1).mean()
         kld = -0.5 * (1 + logsigma - mu.pow(2) - logsigma.exp()).sum(dim=1).mean()
@@ -850,8 +857,9 @@ class VAELabels(VAE):
         return labels_out, mu, logsigma
 
     def calc_loss(self, labels_in, labels_out, mu, logsigma):
-        ce_labels = _nn.CrossEntropyLoss()(labels_in, labels_out)
-        ce_labels_weight = 1. / self.nlabels #TODO: figure out
+        _, labels_in_indices = labels_in.max(dim=1)
+        ce_labels = _nn.CrossEntropyLoss()(labels_out, labels_in_indices)
+        ce_labels_weight = 1. #TODO: figure out
         kld = -0.5 * (1 + logsigma - mu.pow(2) - logsigma.exp()).sum(dim=1).mean()
         kld_weight = 1 / (self.nlatent * self.beta)
         loss = ce_labels*ce_labels_weight + kld * kld_weight
@@ -987,7 +995,8 @@ class VAEVAE(object):
             ce = (depths_out - depths_in).pow(2).sum(dim=1).mean()
             ce_weight = 1 - self.VAEVamb.alpha
 
-        ce_labels = _nn.CrossEntropyLoss()(labels_in, labels_out)
+        _, labels_in_indices = labels_in.max(dim=1)
+        ce_labels = _nn.CrossEntropyLoss()(labels_out, labels_in_indices)
         ce_labels_weight = 1. #TODO: figure out
         sse = (tnf_out - tnf_in).pow(2).sum(dim=1).mean()
         sse_weight = self.VAEVamb.alpha / self.VAEVamb.ntnf
@@ -1039,7 +1048,9 @@ class VAEVAE(object):
 
             optimizer.zero_grad()
 
-            depths_out_sup, tnf_out_sup, labels_out_sup, mu_sup, logsigma_sup = self.VAEJoint(depths_in_sup, tnf_in_sup, labels_in_sup)
+            _, _, _, mu_sup, logsigma_sup = self.VAEJoint(depths_in_sup, tnf_in_sup, labels_in_sup) # use the two-modality latent space
+            depths_out_sup, tnf_out_sup, _, _ = self.VAEVamb(depths_in_sup, tnf_in_sup) # use the one-modality decoders
+            labels_out_sup, _, _ = self.VAELabels(labels_in_sup) # use the one-modality decoders
             depths_out_unsup, tnf_out_unsup,  mu_vamb_unsup, logsigma_vamb_unsup = self.VAEVamb(depths_in_unsup, tnf_in_unsup)
             labels_out_unsup, mu_labels_unsup, logsigma_labels_unsup = self.VAELabels(labels_in_unsup)
 
@@ -1141,3 +1152,64 @@ class VAEVAE(object):
                 pass
 
         return None
+
+    def save(self, filehandle):
+        """Saves the VAE to a path or binary opened file. Load with VAE.load
+
+        Input: Path or binary opened filehandle
+        Output: None
+        """
+        state = {'nsamples': self.nsamples,
+                 'nlabels': self.nlabels,
+                 'alpha': self.alpha,
+                 'beta': self.beta,
+                 'dropout': self.dropout,
+                 'nhiddens': self.nhiddens,
+                 'nlatent': self.nlatent,
+                 'state_VAEVamb': self.VAEVamb.state_dict(),
+                 'state_VAELabels': self.VAELabels.state_dict(),
+                 'state_VAEJoint': self.VAEJoint.state_dict(),
+                }
+
+        _torch.save(state, filehandle)
+
+    @classmethod
+    def load(cls, path, cuda=False, evaluate=True):
+        """Instantiates a VAE from a model file.
+
+        Inputs:
+            path: Path to model file as created by functions VAE.save or
+                  VAE.trainmodel.
+            cuda: If network should work on GPU [False]
+            evaluate: Return network in evaluation mode [True]
+
+        Output: VAE with weights and parameters matching the saved network.
+        """
+
+        # Forcably load to CPU even if model was saves as GPU model
+        dictionary = _torch.load(path, map_location=lambda storage, loc: storage)
+
+        nsamples = dictionary['nsamples']
+        nlabels = dictionary['nlabels']
+        alpha = dictionary['alpha']
+        beta = dictionary['beta']
+        dropout = dictionary['dropout']
+        nhiddens = dictionary['nhiddens']
+        nlatent = dictionary['nlatent']
+
+        vae = cls(nsamples, nlabels, nhiddens, nlatent, alpha, beta, dropout, cuda)
+        vae.VAEVamb.load_state_dict(dictionary['state_VAEVamb'])
+        vae.VAELabels.load_state_dict(dictionary['state_VAELabels'])
+        vae.VAEJoint.load_state_dict(dictionary['state_VAEJoint'])
+
+        if cuda:
+            vae.VAEVamb.cuda()
+            vae.VAELabels.lcuda()
+            vae.VAEJoint.cuda()
+
+        if evaluate:
+            vae.VAEVamb.eval()
+            vae.VAELabels.eval()
+            vae.VAEJoint.eval()
+
+        return vae

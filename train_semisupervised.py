@@ -1,6 +1,7 @@
 import vamb
 import sys
 import argparse
+import pickle
 import numpy as np
 import pandas as pd
 
@@ -18,7 +19,7 @@ CUDA = bool(args['cuda'])
 DIRPATH = args['path']
 PATH_CONTIGS = f'{DIRPATH}/contigs.fna'
 ABUNDANCE_PATH = f'{DIRPATH}/abundance.npz'
-MODEL_PATH = 'model_vamb.pt'
+MODEL_PATH = 'model_semisupervised.pt'
 N_EPOCHS = args['nepoch']
 REFERENCE_PATH = f'{DIRPATH}/reference.tsv'
 
@@ -32,7 +33,14 @@ classes_dict = {r[0]: r[1] for i, r in df_ref.iterrows()}
 classes_order = np.array([classes_dict[c] for c in contignames])
 
 vae = vamb.encode.VAEVAE(nsamples=rpkms.shape[1], nlabels=len(set(classes_order)), cuda=CUDA)
-dataloader, mask = vamb.encode.make_dataloader_semisupervised(rpkms, tnfs, classes_order, SUP)
+dataloader_joint, dataloader_vamb, dataloader_labels, mask, indices_all = \
+    vamb.encode.make_dataloader_semisupervised_random(rpkms, tnfs, classes_order, SUP)
+
+with open(f'indices_{int(SUP*100)}.pickle', 'wb') as handle:
+    pickle.dump(indices_all, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+shapes = (rpkms.shape[1], 103, len(set(classes_order)))
+dataloader = vamb.encode.make_dataloader_semisupervised(dataloader_joint, dataloader_vamb, dataloader_labels, shapes)
 with open(MODEL_PATH, 'wb') as modelfile:
     print('training')
     vae.trainmodel(
@@ -44,10 +52,6 @@ with open(MODEL_PATH, 'wb') as modelfile:
     )
     print('training')
 
-dataloader_both, mask = vamb.encode.make_dataloader_concat(rpkms, tnfs, classes_order)
-dataloader_labels, mask = vamb.encode.make_dataloader_labels(rpkms, tnfs, classes_order)
-dataloader_vamb, mask = vamb.encode.make_dataloader(rpkms, tnfs)
-
 latent = vae.VAEVamb.encode(dataloader_vamb)
 LATENT_PATH = f'latent_trained_semisupervised_{int(SUP*100)}_vamb.npy'
 print('Saving latent space: Vamb')
@@ -58,7 +62,7 @@ LATENT_PATH = f'latent_trained_semisupervised_{int(SUP*100)}_labels.npy'
 print('Saving latent space: Labels')
 np.save(LATENT_PATH, latent)
 
-latent = vae.VAEJoint.encode(dataloader_both)
+latent = vae.VAEJoint.encode(dataloader_joint)
 LATENT_PATH = f'latent_trained_semisupervised_{int(SUP*100)}_both.npy'
 print('Saving latent space: Both')
 np.save(LATENT_PATH, latent)
