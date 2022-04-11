@@ -1049,8 +1049,10 @@ class VAEVAE(object):
             optimizer.zero_grad()
 
             _, _, _, mu_sup, logsigma_sup = self.VAEJoint(depths_in_sup, tnf_in_sup, labels_in_sup) # use the two-modality latent space
-            depths_out_sup, tnf_out_sup, _, _ = self.VAEVamb(depths_in_sup, tnf_in_sup) # use the one-modality decoders
-            labels_out_sup, _, _ = self.VAELabels(labels_in_sup) # use the one-modality decoders
+
+            depths_out_sup, tnf_out_sup = self.VAEVamb._decode(self.VAEVamb.reparameterize(mu_sup, logsigma_sup)) # use the one-modality decoders
+            labels_out_sup = self.VAELabels._decode(self.VAELabels.reparameterize(mu_sup, logsigma_sup)) # use the one-modality decoders
+
             depths_out_unsup, tnf_out_unsup,  mu_vamb_unsup, logsigma_vamb_unsup = self.VAEVamb(depths_in_unsup, tnf_in_unsup)
             labels_out_unsup, mu_labels_unsup, logsigma_labels_unsup = self.VAELabels(labels_in_unsup)
 

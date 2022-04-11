@@ -19,7 +19,7 @@ CUDA = bool(args['cuda'])
 DIRPATH = args['path']
 PATH_CONTIGS = f'{DIRPATH}/contigs.fna'
 ABUNDANCE_PATH = f'{DIRPATH}/abundance.npz'
-MODEL_PATH = 'model_semisupervised.pt'
+MODEL_PATH = f'model_semisupervised_fix_{int(SUP*100)}.pt'
 N_EPOCHS = args['nepoch']
 REFERENCE_PATH = f'{DIRPATH}/reference.tsv'
 
@@ -36,7 +36,7 @@ vae = vamb.encode.VAEVAE(nsamples=rpkms.shape[1], nlabels=len(set(classes_order)
 dataloader_joint, dataloader_vamb, dataloader_labels, mask, indices_all = \
     vamb.encode.make_dataloader_semisupervised_random(rpkms, tnfs, classes_order, SUP)
 
-with open(f'indices_{int(SUP*100)}.pickle', 'wb') as handle:
+with open(f'indices_fix_{int(SUP*100)}.pickle', 'wb') as handle:
     pickle.dump(indices_all, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
 shapes = (rpkms.shape[1], 103, len(set(classes_order)))
@@ -53,16 +53,16 @@ with open(MODEL_PATH, 'wb') as modelfile:
     print('training')
 
 latent = vae.VAEVamb.encode(dataloader_vamb)
-LATENT_PATH = f'latent_trained_semisupervised_{int(SUP*100)}_vamb.npy'
+LATENT_PATH = f'latent_trained_semisupervised_fix_{int(SUP*100)}_vamb.npy'
 print('Saving latent space: Vamb')
 np.save(LATENT_PATH, latent)
 
 latent = vae.VAELabels.encode(dataloader_labels)
-LATENT_PATH = f'latent_trained_semisupervised_{int(SUP*100)}_labels.npy'
+LATENT_PATH = f'latent_trained_semisupervised_fix_{int(SUP*100)}_labels.npy'
 print('Saving latent space: Labels')
 np.save(LATENT_PATH, latent)
 
 latent = vae.VAEJoint.encode(dataloader_joint)
-LATENT_PATH = f'latent_trained_semisupervised_{int(SUP*100)}_both.npy'
+LATENT_PATH = f'latent_trained_semisupervised_fix_{int(SUP*100)}_both.npy'
 print('Saving latent space: Both')
 np.save(LATENT_PATH, latent)
