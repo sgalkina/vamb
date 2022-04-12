@@ -192,7 +192,7 @@ def make_dataloader_semisupervised(dataloader_joint, dataloader_vamb, dataloader
     l_all = _torch.zeros((1, ls))
     l_u_all = _torch.zeros((1, ls))
 
-    for i in range(len(dataloader_labels)):
+    for i in range(len(dataloader_vamb)):
         try:
             d, t, l = next(train_xy_iterator)
         except StopIteration:
