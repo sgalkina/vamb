@@ -6,22 +6,25 @@ import numpy as np
 import pandas as pd
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--path", type=str, default='/Users/nmb127/Documents/vamb_data/data/airways')
+parser.add_argument("--path", type=str, default='/Users/nmb127/Documents/vamb_data/data')
 parser.add_argument("--nepoch", type=int, default=500)
 parser.add_argument('--cuda', action=argparse.BooleanOptionalAction)
 parser.add_argument("--supervision", type=float, default=1.)
 parser.add_argument("--key", type=str, default='species')
+parser.add_argument("--dataset", type=str, default='airways')
 
 args = vars(parser.parse_args())
 print(args)
 
 SUP = args['supervision']
 CUDA = bool(args['cuda'])
-DIRPATH = args['path']
+DATASET = args['dataset']
+DIRPATH = f"{args['path']}/{DATASET}"
 KEY = args['key']
-PATH_CONTIGS = f'{DIRPATH}/contigs.fna'
-ABUNDANCE_PATH = f'{DIRPATH}/abundance.npz'
-MODEL_PATH = f'model_semisupervised_{KEY}_{int(SUP*100)}.pt'
+DEPTH_PATH = f'/home/projects/cpr_10006/projects/vamb/paper_revised/vamb_on_{DATASET}'
+PATH_CONTIGS = f'/home/projects/cpr_10006/projects/vamb/data/datasets/cami2_{DATASET}/contigs_2kbp.fna.gz'
+ABUNDANCE_PATH = f'{DEPTH_PATH}/depths.npz'
+MODEL_PATH = f'model_semisupervised_{DATASET}_{KEY}_{int(SUP*100)}.pt'
 N_EPOCHS = args['nepoch']
 REFERENCE_PATH = f'{DIRPATH}/reference.tsv'
 TAXONOMY_PATH = f'{DIRPATH}/taxonomy.tsv'
@@ -45,11 +48,11 @@ classes_order = np.array([classes_dict[c] for c in contignames])
 
 print(KEY, len(set(classes_order)))
 
-vae = vamb.encode.VAEVAE(nsamples=rpkms.shape[1], nlabels=len(set(classes_order)), cuda=CUDA)
+vae = vamb.encode.VAEVAE(nsamples=rpkms.shape[1], nlabels=max(len(set(classes_order)), 103), cuda=CUDA)
 dataloader_joint, dataloader_vamb, dataloader_labels, mask, indices_all = \
     vamb.encode.make_dataloader_semisupervised_random(rpkms, tnfs, classes_order, SUP)
 
-with open(f'indices_{KEY}_{int(SUP*100)}.pickle', 'wb') as handle:
+with open(f'indices_{DATASET}_{KEY}_{int(SUP*100)}.pickle', 'wb') as handle:
     pickle.dump(indices_all, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
 shapes = (rpkms.shape[1], 103, len(set(classes_order)))
@@ -60,22 +63,21 @@ with open(MODEL_PATH, 'wb') as modelfile:
         dataloader,
         nepochs=N_EPOCHS,
         modelfile=modelfile,
-        batchsteps=None,
         logfile=sys.stdout,
     )
     print('training')
 
 latent = vae.VAEVamb.encode(dataloader_vamb)
-LATENT_PATH = f'latent_trained_semisupervised_{KEY}_{int(SUP*100)}_vamb.npy'
+LATENT_PATH = f'latent_trained_semisupervised_{DATASET}_{KEY}_{int(SUP*100)}_vamb.npy'
 print('Saving latent space: Vamb')
 np.save(LATENT_PATH, latent)
 
 latent = vae.VAELabels.encode(dataloader_labels)
-LATENT_PATH = f'latent_trained_semisupervised_{KEY}_{int(SUP*100)}_labels.npy'
+LATENT_PATH = f'latent_trained_semisupervised_{DATASET}_{KEY}_{int(SUP*100)}_labels.npy'
 print('Saving latent space: Labels')
 np.save(LATENT_PATH, latent)
 
 latent = vae.VAEJoint.encode(dataloader_joint)
-LATENT_PATH = f'latent_trained_semisupervised_{KEY}_{int(SUP*100)}_both.npy'
+LATENT_PATH = f'latent_trained_semisupervised_{DATASET}_{KEY}_{int(SUP*100)}_both.npy'
 print('Saving latent space: Both')
 np.save(LATENT_PATH, latent)

@@ -6,9 +6,10 @@ import numpy as np
 import pandas as pd
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--path", type=str, default='/Users/nmb127/Documents/vamb_data/data/airways')
+parser.add_argument("--path", type=str, default='/Users/nmb127/Documents/vamb_data/data')
 parser.add_argument("--nepoch", type=int, default=500)
 parser.add_argument('--cuda', action=argparse.BooleanOptionalAction)
+parser.add_argument("--dataset", type=str, default='airways')
 parser.add_argument("--supervision", type=float, default=1.)
 
 args = vars(parser.parse_args())
@@ -16,19 +17,22 @@ print(args)
 
 SUP = args['supervision']
 CUDA = bool(args['cuda'])
-DIRPATH = args['path']
-PATH_CONTIGS = f'{DIRPATH}/contigs.fna'
-ABUNDANCE_PATH = f'{DIRPATH}/abundance.npz'
-MODEL_PATH = f'model_semisupervised_mmseq.pt'
+DATASET = args['dataset']
+DIRPATH = f"{args['path']}/{DATASET}"
+DEPTH_PATH = f'/home/projects/cpr_10006/projects/vamb/paper_revised/vamb_on_{DATASET}'
+PATH_CONTIGS = f'{DEPTH_PATH}/contigs.fna'
+ABUNDANCE_PATH = f'{DEPTH_PATH}/depths.npz'
+MODEL_PATH = f'model_semisupervised_mmseq_{DATASET}.pt'
 N_EPOCHS = args['nepoch']
 REFERENCE_PATH = f'{DIRPATH}/reference.tsv'
+MMSEQ_PATH = f'/home/projects/cpr_10006/people/svekut/mmseq2/{DATASET}_taxonomy.tsv'
 
 with vamb.vambtools.Reader(PATH_CONTIGS, 'rb') as filehandle:
     tnfs, contignames, lengths = vamb.parsecontigs.read_contigs(filehandle)
 
 rpkms = vamb.vambtools.read_npz(ABUNDANCE_PATH)
 
-df_mmseq = pd.read_csv(f'airways_taxonomy_clean_new.tsv', delimiter='\t', header=None)
+df_mmseq = pd.read_csv(MMSEQ_PATH, delimiter='\t', header=None)
 df_mmseq_species = df_mmseq[df_mmseq[2] == 'species']
 contigs = np.array(contignames)
 indices_mmseq = [np.argwhere(contigs == c)[0][0] for c in df_mmseq_species[0]]
@@ -36,7 +40,7 @@ classes_order = list(df_mmseq_species[3])
 
 vae = vamb.encode.VAEVAE(nsamples=rpkms.shape[1], nlabels=len(set(classes_order)), cuda=CUDA)
 
-with open(f'indices_mmseq.pickle', 'wb') as handle:
+with open(f'indices_mmseq_{DATASET}.pickle', 'wb') as handle:
     pickle.dump(indices_mmseq, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
 dataloader_vamb, mask = vamb.encode.make_dataloader(rpkms, tnfs)
@@ -51,22 +55,21 @@ with open(MODEL_PATH, 'wb') as modelfile:
         dataloader,
         nepochs=N_EPOCHS,
         modelfile=modelfile,
-        batchsteps=None,
         logfile=sys.stdout,
     )
     print('training')
 
 latent = vae.VAEVamb.encode(dataloader_vamb)
-LATENT_PATH = f'latent_trained_semisupervised_mmseq_vamb.npy'
+LATENT_PATH = f'latent_trained_semisupervised_mmseq_vamb_{DATASET}.npy'
 print('Saving latent space: Vamb')
 np.save(LATENT_PATH, latent)
 
 latent = vae.VAELabels.encode(dataloader_labels)
-LATENT_PATH = f'latent_trained_semisupervised_mmseq_labels.npy'
+LATENT_PATH = f'latent_trained_semisupervised_mmseq_labels_{DATASET}.npy'
 print('Saving latent space: Labels')
 np.save(LATENT_PATH, latent)
 
 latent = vae.VAEJoint.encode(dataloader_joint)
-LATENT_PATH = f'latent_trained_semisupervised_mmseq_both.npy'
+LATENT_PATH = f'latent_trained_semisupervised_mmseq_both_{DATASET}.npy'
 print('Saving latent space: Both')
 np.save(LATENT_PATH, latent)

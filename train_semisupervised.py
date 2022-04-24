@@ -10,6 +10,7 @@ parser.add_argument("--path", type=str, default='/Users/nmb127/Documents/vamb_da
 parser.add_argument("--nepoch", type=int, default=500)
 parser.add_argument('--cuda', action=argparse.BooleanOptionalAction)
 parser.add_argument("--supervision", type=float, default=1.)
+parser.add_argument("--dataset", type=str, default='airways')
 
 args = vars(parser.parse_args())
 print(args)
@@ -17,8 +18,10 @@ print(args)
 SUP = args['supervision']
 CUDA = bool(args['cuda'])
 DIRPATH = args['path']
-PATH_CONTIGS = f'{DIRPATH}/contigs.fna'
-ABUNDANCE_PATH = f'{DIRPATH}/abundance.npz'
+DATASET = args['dataset']
+DEPTH_PATH = f'/home/projects/cpr_10006/projects/vamb/paper_revised/vamb_on_{DATASET}'
+PATH_CONTIGS = f'{DEPTH_PATH}/contigs.fna'
+ABUNDANCE_PATH = f'{DEPTH_PATH}/depths.npz'
 MODEL_PATH = f'model_semisupervised_fix_{int(SUP*100)}.pt'
 N_EPOCHS = args['nepoch']
 REFERENCE_PATH = f'{DIRPATH}/reference.tsv'

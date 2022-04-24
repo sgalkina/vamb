@@ -136,6 +136,8 @@ def make_dataloader_labels(rpkm, tnf, labels, batchsize=256, destroy=False, cuda
     depthstensor, tnftensor, batchsize, n_workers, cuda, mask = _make_dataset(rpkm, tnf, batchsize=batchsize, destroy=destroy, cuda=cuda)
     labels_int = _np.unique(labels, return_inverse=True)[1]
     one_hot_labels = F.one_hot(_torch.as_tensor(labels_int)).float()
+    if one_hot_labels.shape[1] < 103:
+        one_hot_labels = F.pad(one_hot_labels, (1, 103 - one_hot_labels.shape[1]), "constant", 0) # BIG HACK, for when nlabels < 103
     dataset = _TensorDataset(one_hot_labels)
     dataloader = _DataLoader(dataset=dataset, batch_size=batchsize, drop_last=True,
                              shuffle=True, num_workers=n_workers, pin_memory=cuda)
