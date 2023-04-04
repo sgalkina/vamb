@@ -12,4 +12,4 @@ conda activate vamb_env
 path=/home/projects/cpr_10006/people/paupie/Data/data/airways/
 nepoch=500
 
-python3 train_semisupervised_tax.py  --path "$path" --nepoch $nepoch --cuda --supervision 0.5 --key species
+python3 train_embeddings.py  --path "$path" --nepoch $nepoch --cuda

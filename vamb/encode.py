@@ -136,13 +136,36 @@ def make_dataloader_labels(rpkm, tnf, labels, batchsize=256, destroy=False, cuda
     depthstensor, tnftensor, batchsize, n_workers, cuda, mask = _make_dataset(rpkm, tnf, batchsize=batchsize, destroy=destroy, cuda=cuda)
     labels_int = _np.unique(labels, return_inverse=True)[1]
     one_hot_labels = F.one_hot(_torch.as_tensor(labels_int)).float()
-    if one_hot_labels.shape[1] < 103:
-        one_hot_labels = F.pad(one_hot_labels, (1, 103 - one_hot_labels.shape[1]), "constant", 0) # BIG HACK, for when nlabels < 103
+    if one_hot_labels.shape[1] < 105:
+        one_hot_labels = F.pad(one_hot_labels, (1, 105 - one_hot_labels.shape[1]), "constant", 0) # BIG HACK, for when nlabels < 103
     dataset = _TensorDataset(one_hot_labels)
     dataloader = _DataLoader(dataset=dataset, batch_size=batchsize, drop_last=True,
                              shuffle=True, num_workers=n_workers, pin_memory=cuda)
 
     return dataloader, mask
+
+
+def make_dataloader_embeddings(rpkm, tnf, labels, batchsize=256, destroy=False, cuda=False):
+    depthstensor, tnftensor, batchsize, n_workers, cuda, mask = _make_dataset(rpkm, tnf, batchsize=batchsize, destroy=destroy, cuda=cuda)
+    labels = _torch.as_tensor(labels).float()
+    if labels.shape[1] < 105:
+        labels = F.pad(labels, (1, 105 - labels.shape[1]), "constant", 0) # BIG HACK, for when nlabels < 103
+    dataset = _TensorDataset(labels)
+    dataloader = _DataLoader(dataset=dataset, batch_size=batchsize, drop_last=True,
+                             shuffle=True, num_workers=n_workers, pin_memory=cuda)
+
+    return dataloader, mask
+
+
+def make_dataloader_concat_embeddings(rpkm, tnf, labels, batchsize=256, destroy=False, cuda=False):
+    depthstensor, tnftensor, batchsize, n_workers, cuda, mask = _make_dataset(rpkm, tnf, batchsize=batchsize, destroy=destroy, cuda=cuda)
+    labels = _torch.as_tensor(labels).float()
+    dataset = _TensorDataset(depthstensor, tnftensor, labels)
+    dataloader = _DataLoader(dataset=dataset, batch_size=batchsize, drop_last=True,
+                             shuffle=True, num_workers=n_workers, pin_memory=cuda)
+
+    return dataloader, mask
+
 
 def get_samplers(N_data, no_labels_share, index_start=0):
     indices = list(range(index_start, index_start+N_data))
@@ -966,6 +989,43 @@ class VAELabels(VAE):
         return latent
 
 
+class VAEEmbeddings(VAELabels):
+    """Variational autoencoder that encodes only the labels word2vec embeddings, subclass of VAE.
+
+    Instantiate with:
+        nsamples: Number of samples in abundance matrix
+        nhiddens: List of n_neurons in the hidden layers [None=Auto]
+        nlatent: Number of neurons in the latent layer [32]
+        alpha: Approximate starting TNF/(CE+TNF) ratio in loss. [None = Auto]
+        beta: Multiply KLD by the inverse of this value [200]
+        dropout: Probability of dropout on forward pass [0.2]
+        cuda: Use CUDA (GPU accelerated training) [False]
+
+    vae.trainmodel(dataloader, nepochs batchsteps, lrate, logfile, modelfile)
+        Trains the model, returning None
+
+    vae.encode(self, data_loader):
+        Encodes the data in the data loader and returns the encoded matrix.
+
+    If alpha or dropout is None and there is only one sample, they are set to
+    0.99 and 0.0, respectively
+    """
+
+    def __init__(self, nlabels, nhiddens=None, nlatent=32, alpha=None,
+                 beta=200, dropout=0.2, cuda=False):
+        super(VAEEmbeddings, self).__init__(nlabels, nhiddens=nhiddens, nlatent=nlatent, alpha=alpha,
+                 beta=beta, dropout=dropout, cuda=cuda)
+        self.nlabels = nlabels
+
+    def calc_loss(self, labels_in, labels_out, mu, logsigma):
+        mse_labels = _nn.L1Loss()(labels_in, labels_out)
+        ce_labels_weight = 20. #TODO: figure out
+        kld = -0.5 * (1 + logsigma - mu.pow(2) - logsigma.exp()).sum(dim=1).mean()
+        kld_weight = 1 / (self.nlatent * self.beta)
+        loss = mse_labels*ce_labels_weight + kld * kld_weight
+        return loss, mse_labels, kld, _torch.as_tensor(666)
+
+
 def kld_gauss(p_mu, p_std, q_mu, q_std):
     p = _torch.distributions.normal.Normal(p_mu, p_std)
     q = _torch.distributions.normal.Normal(q_mu, q_std)
@@ -981,6 +1041,348 @@ class VAEVAE(object):
         self.VAELabels = VAELabels(nlabels, nhiddens=nhiddens, nlatent=nlatent, alpha=alpha,
                  beta=beta, dropout=dropout, cuda=cuda)
         self.VAEJoint = VAEConcat(nsamples, nlabels, nhiddens=nhiddens, nlatent=nlatent, alpha=alpha,
+                 beta=beta, dropout=dropout, cuda=cuda)
+
+    def calc_loss_joint(self, depths_in, depths_out, tnf_in, tnf_out, labels_in, labels_out, 
+                            mu_sup, logsigma_sup, 
+                            mu_vamb_unsup, logsigma_vamb_unsup,
+                            mu_labels_unsup, logsigma_labels_unsup,
+                            ):
+        # If multiple samples, use cross entropy, else use SSE for abundance
+        if self.VAEVamb.nsamples > 1:
+            # Add 1e-9 to depths_out to avoid numerical instability.
+            ce = - ((depths_out + 1e-9).log() * depths_in).sum(dim=1).mean()
+            ce_weight = (1 - self.VAEVamb.alpha) / _log(self.VAEVamb.nsamples)
+        else:
+            ce = (depths_out - depths_in).pow(2).sum(dim=1).mean()
+            ce_weight = 1 - self.VAEVamb.alpha
+
+        _, labels_in_indices = labels_in.max(dim=1)
+        ce_labels = _nn.CrossEntropyLoss()(labels_out, labels_in_indices)
+        ce_labels_weight = 1. #TODO: figure out
+        sse = (tnf_out - tnf_in).pow(2).sum(dim=1).mean()
+        sse_weight = self.VAEVamb.alpha / self.VAEVamb.ntnf
+        kld_weight = 1 / (self.VAEVamb.nlatent * self.VAEVamb.beta)
+
+        kld_vamb = kld_gauss(mu_sup, logsigma_sup, mu_vamb_unsup, logsigma_vamb_unsup)
+        kld_labels = kld_gauss(mu_sup, logsigma_sup, mu_labels_unsup, logsigma_labels_unsup)
+        kld = kld_vamb + kld_labels
+
+        loss = ce * ce_weight + sse * sse_weight + ce_labels*ce_labels_weight + kld * kld_weight
+
+        _, labels_out_indices = labels_out.max(dim=1)
+        _, labels_in_indices = labels_in.max(dim=1)
+        return loss, ce, sse, ce_labels, kld_vamb, kld_labels, _torch.sum(labels_out_indices == labels_in_indices)
+
+    def trainepoch(self, data_loader, epoch, optimizer, batchsteps, logfile):
+        metrics = [
+            'loss_vamb', 'ce_vamb', 'sse_vamb', 'kld_vamb', 
+            'loss_labels', 'ce_labels_labels', 'kld_labels', 'correct_labels_labels',
+            'loss_joint', 'ce_joint', 'sse_joint', 'ce_labels_joint', 'kld_vamb_joint', 'kld_labels_joint', 'correct_labels_joint',
+            'loss',
+        ]
+        metrics_dict = {k: 0 for k in metrics}
+        tensors_dict = {k: None for k in metrics}
+
+        if epoch in batchsteps:
+            data_loader = _DataLoader(dataset=data_loader.dataset,
+                                      batch_size=data_loader.batch_size * 2,
+                                      shuffle=True,
+                                      drop_last=True,
+                                      num_workers=data_loader.num_workers,
+                                      pin_memory=data_loader.pin_memory)
+
+        for depths_in_sup, tnf_in_sup, labels_in_sup, depths_in_unsup, tnf_in_unsup, labels_in_unsup in data_loader:
+            depths_in_sup.requires_grad = True
+            tnf_in_sup.requires_grad = True
+            labels_in_sup.requires_grad = True
+            depths_in_unsup.requires_grad = True
+            tnf_in_unsup.requires_grad = True
+            labels_in_unsup.requires_grad = True
+
+            if self.VAEVamb.usecuda:
+                depths_in_sup = depths_in_sup.cuda()
+                tnf_in_sup = tnf_in_sup.cuda()
+                labels_in_sup = labels_in_sup.cuda()
+                depths_in_unsup = depths_in_unsup.cuda()
+                tnf_in_unsup = tnf_in_unsup.cuda()
+                labels_in_unsup = labels_in_unsup.cuda()
+
+            optimizer.zero_grad()
+
+            _, _, _, mu_sup, logsigma_sup = self.VAEJoint(depths_in_sup, tnf_in_sup, labels_in_sup) # use the two-modality latent space
+
+            depths_out_sup, tnf_out_sup = self.VAEVamb._decode(self.VAEVamb.reparameterize(mu_sup, logsigma_sup)) # use the one-modality decoders
+            labels_out_sup = self.VAELabels._decode(self.VAELabels.reparameterize(mu_sup, logsigma_sup)) # use the one-modality decoders
+
+            depths_out_unsup, tnf_out_unsup,  mu_vamb_unsup, logsigma_vamb_unsup = self.VAEVamb(depths_in_unsup, tnf_in_unsup)
+            labels_out_unsup, mu_labels_unsup, logsigma_labels_unsup = self.VAELabels(labels_in_unsup)
+
+            tensors_dict['loss_vamb'], tensors_dict['ce_vamb'], tensors_dict['sse_vamb'], tensors_dict['kld_vamb'] = \
+                self.VAEVamb.calc_loss(depths_in_unsup, depths_out_unsup, tnf_in_unsup, tnf_out_unsup, mu_vamb_unsup, logsigma_vamb_unsup)
+            tensors_dict['loss_labels'], tensors_dict['ce_labels_labels'], tensors_dict['kld_labels'], tensors_dict['correct_labels_labels'] = \
+                self.VAELabels.calc_loss(labels_in_unsup, labels_out_unsup, mu_labels_unsup, logsigma_labels_unsup)
+            
+            tensors_dict['loss_joint'], tensors_dict['ce_joint'], tensors_dict['sse_joint'], tensors_dict['ce_labels_joint'], \
+                tensors_dict['kld_vamb_joint'], tensors_dict['kld_labels_joint'], tensors_dict['correct_labels_joint'] = self.calc_loss_joint(
+                    depths_in_sup, depths_out_sup, tnf_in_sup, tnf_out_sup, labels_in_sup, labels_out_sup, 
+                    mu_sup, logsigma_sup, 
+                    mu_vamb_unsup, logsigma_vamb_unsup,
+                    mu_labels_unsup, logsigma_labels_unsup,
+                )
+
+            tensors_dict['loss'] = tensors_dict['loss_joint'] + tensors_dict['loss_vamb'] + tensors_dict['loss_labels']
+
+            tensors_dict['loss'].backward()
+            optimizer.step()
+
+            for k, v in tensors_dict.items():
+                metrics_dict[k] += v.data.item()
+
+        metrics_dict['correct_labels_joint'] /= 256
+        metrics_dict['correct_labels_labels'] /= 256
+        if logfile is not None:
+            print(', '.join([k + f' {v/len(data_loader):.6f}' for k, v in metrics_dict.items()]), file=logfile)
+            logfile.flush()
+
+        return data_loader
+
+    def trainmodel(self, dataloader, nepochs=500, lrate=1e-3,
+                   batchsteps=[25, 75, 150, 300], logfile=None, modelfile=None):
+        """Train the autoencoder from depths array and tnf array.
+
+        Inputs:
+            dataloader: DataLoader made by make_dataloader
+            nepochs: Train for this many epochs before encoding [500]
+            lrate: Starting learning rate for the optimizer [0.001]
+            batchsteps: None or double batchsize at these epochs [25, 75, 150, 300]
+            logfile: Print status updates to this file if not None [None]
+            modelfile: Save models to this file if not None [None]
+
+        Output: None
+        """
+
+        if lrate < 0:
+            raise ValueError('Learning rate must be positive, not {}'.format(lrate))
+
+        if nepochs < 1:
+            raise ValueError('Minimum 1 epoch, not {}'.format(nepochs))
+
+        if batchsteps is None:
+            batchsteps_set = set()
+        else:
+            # First collect to list in order to allow all element types, then check that
+            # they are integers
+            batchsteps = list(batchsteps)
+            if not all(isinstance(i, int) for i in batchsteps):
+                raise ValueError('All elements of batchsteps must be integers')
+            if max(batchsteps, default=0) >= nepochs:
+                raise ValueError('Max batchsteps must not equal or exceed nepochs')
+            last_batchsize = dataloader.batch_size * 2**len(batchsteps)
+            if len(dataloader.dataset) < last_batchsize:
+                raise ValueError('Last batch size exceeds dataset length')
+            batchsteps_set = set(batchsteps)
+
+        # Get number of features
+        ncontigs, nsamples = dataloader.dataset.tensors[0].shape
+        optimizer = _Adam(list(self.VAEVamb.parameters()) + list(self.VAELabels.parameters()) + list(self.VAEJoint.parameters()), lr=lrate)
+
+        if logfile is not None:
+            print('\tNetwork properties:', file=logfile)
+            print('\tCUDA:', self.VAEVamb.usecuda, file=logfile)
+            print('\tAlpha:', self.VAEVamb.alpha, file=logfile)
+            print('\tBeta:', self.VAEVamb.beta, file=logfile)
+            print('\tDropout:', self.VAEVamb.dropout, file=logfile)
+            print('\tN hidden:', ', '.join(map(str, self.VAEVamb.nhiddens)), file=logfile)
+            print('\tN latent:', self.VAEVamb.nlatent, file=logfile)
+            print('\n\tTraining properties:', file=logfile)
+            print('\tN epochs:', nepochs, file=logfile)
+            print('\tStarting batch size:', dataloader.batch_size, file=logfile)
+            batchsteps_string = ', '.join(map(str, sorted(batchsteps))) if batchsteps_set else "None"
+            print('\tBatchsteps:', batchsteps_string, file=logfile)
+            print('\tLearning rate:', lrate, file=logfile)
+            print('\tN sequences:', ncontigs, file=logfile)
+            print('\tN samples:', nsamples, file=logfile, end='\n\n')
+
+        # Train
+        for epoch in range(nepochs):
+            dataloader = self.trainepoch(dataloader, epoch, optimizer, batchsteps_set, logfile)
+
+        # Save weights - Lord forgive me, for I have sinned when catching all exceptions
+        if modelfile is not None:
+            try:
+                self.save(modelfile)
+            except:
+                pass
+
+        return None
+
+    def save(self, filehandle):
+        """Saves the VAE to a path or binary opened file. Load with VAE.load
+
+        Input: Path or binary opened filehandle
+        Output: None
+        """
+        state = {'nsamples': self.nsamples,
+                 'nlabels': self.nlabels,
+                 'alpha': self.alpha,
+                 'beta': self.beta,
+                 'dropout': self.dropout,
+                 'nhiddens': self.nhiddens,
+                 'nlatent': self.nlatent,
+                 'state_VAEVamb': self.VAEVamb.state_dict(),
+                 'state_VAELabels': self.VAELabels.state_dict(),
+                 'state_VAEJoint': self.VAEJoint.state_dict(),
+                }
+
+        _torch.save(state, filehandle)
+
+    @classmethod
+    def load(cls, path, cuda=False, evaluate=True):
+        """Instantiates a VAE from a model file.
+
+        Inputs:
+            path: Path to model file as created by functions VAE.save or
+                  VAE.trainmodel.
+            cuda: If network should work on GPU [False]
+            evaluate: Return network in evaluation mode [True]
+
+        Output: VAE with weights and parameters matching the saved network.
+        """
+
+        # Forcably load to CPU even if model was saves as GPU model
+        dictionary = _torch.load(path, map_location=lambda storage, loc: storage)
+
+        nsamples = dictionary['nsamples']
+        nlabels = dictionary['nlabels']
+        alpha = dictionary['alpha']
+        beta = dictionary['beta']
+        dropout = dictionary['dropout']
+        nhiddens = dictionary['nhiddens']
+        nlatent = dictionary['nlatent']
+
+        vae = cls(nsamples, nlabels, nhiddens, nlatent, alpha, beta, dropout, cuda)
+        vae.VAEVamb.load_state_dict(dictionary['state_VAEVamb'])
+        vae.VAELabels.load_state_dict(dictionary['state_VAELabels'])
+        vae.VAEJoint.load_state_dict(dictionary['state_VAEJoint'])
+
+        if cuda:
+            vae.VAEVamb.cuda()
+            vae.VAELabels.lcuda()
+            vae.VAEJoint.cuda()
+
+        if evaluate:
+            vae.VAEVamb.eval()
+            vae.VAELabels.eval()
+            vae.VAEJoint.eval()
+
+        return vae
+
+
+class VAEConcatEmbeddings(VAEConcat):
+    """Variational autoencoder that uses labels as concatented input, subclass of VAE.
+
+    Instantiate with:
+        nsamples: Number of samples in abundance matrix
+        nhiddens: List of n_neurons in the hidden layers [None=Auto]
+        nlatent: Number of neurons in the latent layer [32]
+        alpha: Approximate starting TNF/(CE+TNF) ratio in loss. [None = Auto]
+        beta: Multiply KLD by the inverse of this value [200]
+        dropout: Probability of dropout on forward pass [0.2]
+        cuda: Use CUDA (GPU accelerated training) [False]
+
+    vae.trainmodel(dataloader, nepochs batchsteps, lrate, logfile, modelfile)
+        Trains the model, returning None
+
+    vae.encode(self, data_loader):
+        Encodes the data in the data loader and returns the encoded matrix.
+
+    If alpha or dropout is None and there is only one sample, they are set to
+    0.99 and 0.0, respectively
+    """
+
+    def __init__(self, nsamples, nlabels, nhiddens=None, nlatent=32, alpha=None,
+                 beta=200, dropout=0.2, cuda=False):
+        super(VAEConcatEmbeddings, self).__init__(nsamples, nlabels, nhiddens=nhiddens, nlatent=nlatent, alpha=alpha,
+                 beta=beta, dropout=dropout, cuda=cuda)
+
+    def calc_loss(self, depths_in, depths_out, tnf_in, tnf_out, labels_in, labels_out, mu, logsigma):
+        # If multiple samples, use cross entropy, else use SSE for abundance
+        if self.nsamples > 1:
+            # Add 1e-9 to depths_out to avoid numerical instability.
+            ce = - ((depths_out + 1e-9).log() * depths_in).sum(dim=1).mean()
+            ce_weight = (1 - self.alpha) / _log(self.nsamples)
+        else:
+            ce = (depths_out - depths_in).pow(2).sum(dim=1).mean()
+            ce_weight = 1 - self.alpha
+
+        ce_labels = _nn.L1Loss()(labels_in, labels_out)
+        ce_labels_weight = 20. #TODO: figure out
+        sse = (tnf_out - tnf_in).pow(2).sum(dim=1).mean()
+        kld = -0.5 * (1 + logsigma - mu.pow(2) - logsigma.exp()).sum(dim=1).mean()
+        sse_weight = self.alpha / self.ntnf
+        kld_weight = 1 / (self.nlatent * self.beta)
+        loss = ce * ce_weight + sse * sse_weight + ce_labels*ce_labels_weight + kld * kld_weight
+
+        _, labels_out_indices = labels_out.max(dim=1)
+        _, labels_in_indices = labels_in.max(dim=1)
+        return loss, ce, sse, ce_labels, kld, _torch.sum(labels_out_indices == labels_in_indices)
+
+
+
+class VAEVAEEmbeddings(VAEVAE):
+    def __init__(self, nsamples, nlabels, nhiddens=None, nlatent=32, alpha=None,
+                 beta=200, dropout=0.2, cuda=False):
+        super(VAEVAEEmbeddings, self).__init__(nsamples, nlabels, nhiddens=nhiddens, nlatent=nlatent, alpha=alpha,
+                 beta=beta, dropout=dropout, cuda=cuda)
+        self.VAEVamb = VAE(nsamples, nhiddens=nhiddens, nlatent=nlatent, alpha=alpha,
+                 beta=beta, dropout=dropout, cuda=cuda)
+        self.VAELabels = VAEEmbeddings(nlabels, nhiddens=nhiddens, nlatent=nlatent, alpha=alpha,
+                 beta=beta, dropout=dropout, cuda=cuda)
+        self.VAEJoint = VAEConcatEmbeddings(nsamples, nlabels, nhiddens=nhiddens, nlatent=nlatent, alpha=alpha,
+                 beta=beta, dropout=dropout, cuda=cuda)
+
+    def calc_loss_joint(self, depths_in, depths_out, tnf_in, tnf_out, labels_in, labels_out, 
+                            mu_sup, logsigma_sup, 
+                            mu_vamb_unsup, logsigma_vamb_unsup,
+                            mu_labels_unsup, logsigma_labels_unsup,
+                            ):
+        # If multiple samples, use cross entropy, else use SSE for abundance
+        if self.VAEVamb.nsamples > 1:
+            # Add 1e-9 to depths_out to avoid numerical instability.
+            ce = - ((depths_out + 1e-9).log() * depths_in).sum(dim=1).mean()
+            ce_weight = (1 - self.VAEVamb.alpha) / _log(self.VAEVamb.nsamples)
+        else:
+            ce = (depths_out - depths_in).pow(2).sum(dim=1).mean()
+            ce_weight = 1 - self.VAEVamb.alpha
+
+        ce_labels = _nn.L1Loss()(labels_in, labels_out)
+        ce_labels_weight = 20. #TODO: figure out
+        sse = (tnf_out - tnf_in).pow(2).sum(dim=1).mean()
+        sse_weight = self.VAEVamb.alpha / self.VAEVamb.ntnf
+        kld_weight = 1 / (self.VAEVamb.nlatent * self.VAEVamb.beta)
+
+        kld_vamb = kld_gauss(mu_sup, logsigma_sup, mu_vamb_unsup, logsigma_vamb_unsup)
+        kld_labels = kld_gauss(mu_sup, logsigma_sup, mu_labels_unsup, logsigma_labels_unsup)
+        kld = kld_vamb + kld_labels
+
+        loss = ce * ce_weight + sse * sse_weight + ce_labels*ce_labels_weight + kld * kld_weight
+
+        _, labels_out_indices = labels_out.max(dim=1)
+        _, labels_in_indices = labels_in.max(dim=1)
+        return loss, ce, sse, ce_labels, kld_vamb, kld_labels, _torch.sum(labels_out_indices == labels_in_indices)
+
+
+class SVAE(VAEVAE):
+    def __init__(self, nsamples, nlabels, nhiddens=None, nlatent=32, alpha=None,
+                 beta=200, dropout=0.2, cuda=False):
+        self.VAEVamb = VAE(nsamples, nhiddens=nhiddens, nlatent=nlatent, alpha=alpha,
+                 beta=beta, dropout=dropout, cuda=cuda)
+        self.VAEVamb_star = VAE(nsamples, nhiddens=nhiddens, nlatent=nlatent, alpha=alpha,
+                 beta=beta, dropout=dropout, cuda=cuda)
+        self.VAELabels = VAELabels(nlabels, nhiddens=nhiddens, nlatent=nlatent, alpha=alpha,
+                 beta=beta, dropout=dropout, cuda=cuda)
+        self.VAELabels_star = VAELabels(nlabels, nhiddens=nhiddens, nlatent=nlatent, alpha=alpha,
                  beta=beta, dropout=dropout, cuda=cuda)
 
     def calc_loss_joint(self, depths_in, depths_out, tnf_in, tnf_out, labels_in, labels_out, 

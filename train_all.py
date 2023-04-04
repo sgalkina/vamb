@@ -8,14 +8,17 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--path", type=str, default='/Users/nmb127/Documents/vamb_data/data/airways')
 parser.add_argument("--nepoch", type=int, default=500)
 parser.add_argument('--cuda', action=argparse.BooleanOptionalAction)
+parser.add_argument("--dataset", type=str, default='airways')
 
 args = vars(parser.parse_args())
 print(args)
 
 CUDA = bool(args['cuda'])
 DIRPATH = args['path']
-PATH_CONTIGS = f'{DIRPATH}/contigs.fna'
-ABUNDANCE_PATH = f'{DIRPATH}/abundance.npz'
+DATASET = args['dataset']
+DEPTH_PATH = f'/home/projects/cpr_10006/projects/vamb/paper_revised/vamb_on_{DATASET}'
+PATH_CONTIGS = f'{DEPTH_PATH}/contigs.fna'
+ABUNDANCE_PATH = f'{DEPTH_PATH}/depths.npz'
 MODEL_PATH = 'model_vamb.pt'
 N_EPOCHS = args['nepoch']
 LATENT_PATH = 'latent_trained_semisupervised.npy'
@@ -38,7 +41,6 @@ with open(MODEL_PATH, 'wb') as modelfile:
         dataloader,
         nepochs=N_EPOCHS,
         modelfile=modelfile,
-        batchsteps=None,
         logfile=sys.stdout,
     )
     print('training')

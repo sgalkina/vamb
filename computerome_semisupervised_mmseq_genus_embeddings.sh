@@ -9,7 +9,8 @@ source ~/.bashrc
 conda init bash
 conda activate vamb_env
 
-path=/home/projects/cpr_10006/people/paupie/Data/data/airways/
+path=/home/projects/cpr_10006/people/paupie/Data/data
 nepoch=500
+dataset=$1
 
-python3 train_semisupervised_tax.py  --path "$path" --nepoch $nepoch --cuda --supervision 0.5 --key species
+python3 train_mmseq_embeddings.py  --path "$path" --nepoch $nepoch --cuda  --dataset $dataset

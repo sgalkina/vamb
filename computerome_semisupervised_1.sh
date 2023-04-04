@@ -9,7 +9,7 @@ source ~/.bashrc
 conda init bash
 conda activate vamb_env
 
-path=/home/projects/cpr_10006/people/paupie/Data/data/airways/
+path=/home/projects/cpr_10006/people/paupie/Data/data
 nepoch=500
 
 python3 train_semisupervised.py  --path "$path" --nepoch $nepoch --cuda --supervision 0.01

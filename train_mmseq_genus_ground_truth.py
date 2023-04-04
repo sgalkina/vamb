@@ -9,9 +9,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--path", type=str, default='/Users/nmb127/Documents/vamb_data/data')
 parser.add_argument("--nepoch", type=int, default=500)
 parser.add_argument('--cuda', action=argparse.BooleanOptionalAction)
-parser.add_argument("--supervision", type=float, default=1.)
-parser.add_argument("--key", type=str, default='species')
 parser.add_argument("--dataset", type=str, default='airways')
+parser.add_argument("--supervision", type=float, default=1.)
 
 args = vars(parser.parse_args())
 print(args)
@@ -20,40 +19,44 @@ SUP = args['supervision']
 CUDA = bool(args['cuda'])
 DATASET = args['dataset']
 DIRPATH = f"{args['path']}/{DATASET}"
-KEY = args['key']
 DEPTH_PATH = f'/home/projects/cpr_10006/projects/vamb/paper_revised/vamb_on_{DATASET}'
-PATH_CONTIGS = f'/home/projects/cpr_10006/projects/vamb/data/datasets/cami2_{DATASET}/contigs_2kbp.fna.gz'
+PATH_CONTIGS = f'{DEPTH_PATH}/contigs_2kbp.fna.gz'
 ABUNDANCE_PATH = f'{DEPTH_PATH}/depths.npz'
-MODEL_PATH = f'model_semisupervised_{DATASET}_{KEY}_{int(SUP*100)}.pt'
+MODEL_PATH = f'model_semisupervised_mmseq_genus_truth.pt'
 N_EPOCHS = args['nepoch']
 REFERENCE_PATH = f'{DIRPATH}/reference.tsv'
 TAXONOMY_PATH = f'{DIRPATH}/taxonomy.tsv'
+MMSEQ_PATH = f'/home/projects/cpr_10006/people/svekut/mmseq2/{DATASET}_taxonomy.tsv'
 
 with vamb.vambtools.Reader(PATH_CONTIGS, 'rb') as filehandle:
     tnfs, contignames, lengths = vamb.parsecontigs.read_contigs(filehandle)
 
 rpkms = vamb.vambtools.read_npz(ABUNDANCE_PATH)
 
-df_ref = pd.read_csv(REFERENCE_PATH, delimiter='\t', header=None)
 df_tax = pd.read_csv(TAXONOMY_PATH, delimiter='\t', header=None)
-
 genus_dict = {r[0]: r[2] for _, r in df_tax.iterrows()}
 species_dict = {r[0]: r[1] for _, r in df_tax.iterrows()}
 
+df_ref = pd.read_csv(REFERENCE_PATH, delimiter='\t', header=None)
 df_ref['genus'] = df_ref[1].map(genus_dict)
-df_ref['species'] = df_ref[1].map(species_dict)
+classes_dict = {r[0]: r['genus'] for i, r in df_ref.iterrows()}
 
-classes_dict = {r[0]: r[KEY] for i, r in df_ref.iterrows()}
-classes_order = np.array([classes_dict[c] for c in contignames])
+df_mmseq = pd.read_csv(MMSEQ_PATH, delimiter='\t', header=None)
+df_mmseq_genus = df_mmseq[(df_mmseq[2] == 'genus') | (df_mmseq[2] == 'species')]
+df_mmseq_genus['genus'] = df_mmseq_genus[8].str.split(';').str[5]
+contigs = np.array(contignames)
+indices_mmseq = [np.argwhere(contigs == c)[0][0] for c in df_mmseq_genus[0]]
+# classes_order = list(df_mmseq_genus['genus'])
+classes_order = np.array([classes_dict[c] for c in contignames])[indices_mmseq]
 
-print(KEY, len(set(classes_order)))
+vae = vamb.encode.VAEVAE(nsamples=rpkms.shape[1], nlabels=len(set(classes_order)), cuda=CUDA)
 
-vae = vamb.encode.VAEVAE(nsamples=rpkms.shape[1], nlabels=max(len(set(classes_order)), 105), cuda=CUDA)
-dataloader_joint, dataloader_vamb, dataloader_labels, mask, indices_all = \
-    vamb.encode.make_dataloader_semisupervised_random(rpkms, tnfs, classes_order, SUP)
+with open(f'indices_mmseq_genus_{DATASET}_truth.pickle', 'wb') as handle:
+    pickle.dump(indices_mmseq, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
-with open(f'indices_{DATASET}_{KEY}_{int(SUP*100)}.pickle', 'wb') as handle:
-    pickle.dump(indices_all, handle, protocol=pickle.HIGHEST_PROTOCOL)
+dataloader_vamb, mask = vamb.encode.make_dataloader(rpkms, tnfs)
+dataloader_joint, mask = vamb.encode.make_dataloader_concat(rpkms[indices_mmseq], tnfs[indices_mmseq], classes_order)
+dataloader_labels, mask = vamb.encode.make_dataloader_labels(rpkms[indices_mmseq], tnfs[indices_mmseq], classes_order)
 
 shapes = (rpkms.shape[1], 103, len(set(classes_order)))
 dataloader = vamb.encode.make_dataloader_semisupervised(dataloader_joint, dataloader_vamb, dataloader_labels, shapes)
@@ -68,16 +71,16 @@ with open(MODEL_PATH, 'wb') as modelfile:
     print('training')
 
 latent = vae.VAEVamb.encode(dataloader_vamb)
-LATENT_PATH = f'latent_trained_semisupervised_{DATASET}_{KEY}_{int(SUP*100)}_vamb.npy'
+LATENT_PATH = f'latent_trained_semisupervised_mmseq_genus_vamb_{DATASET}_truth.npy'
 print('Saving latent space: Vamb')
 np.save(LATENT_PATH, latent)
 
 latent = vae.VAELabels.encode(dataloader_labels)
-LATENT_PATH = f'latent_trained_semisupervised_{DATASET}_{KEY}_{int(SUP*100)}_labels.npy'
+LATENT_PATH = f'latent_trained_semisupervised_mmseq_genus_labels_{DATASET}_truth.npy'
 print('Saving latent space: Labels')
 np.save(LATENT_PATH, latent)
 
 latent = vae.VAEJoint.encode(dataloader_joint)
-LATENT_PATH = f'latent_trained_semisupervised_{DATASET}_{KEY}_{int(SUP*100)}_both.npy'
+LATENT_PATH = f'latent_trained_semisupervised_mmseq_genus_both_{DATASET}_truth.npy'
 print('Saving latent space: Both')
 np.save(LATENT_PATH, latent)

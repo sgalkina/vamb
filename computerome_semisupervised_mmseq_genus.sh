@@ -11,5 +11,6 @@ conda activate vamb_env
 
 path=/home/projects/cpr_10006/people/paupie/Data/data/airways/
 nepoch=500
+dataset=$1
 
-python3 train_mmseq_genus.py  --path "$path" --nepoch $nepoch --cuda
+python3 train_mmseq_genus.py  --path "$path" --nepoch $nepoch --cuda  --dataset $dataset
