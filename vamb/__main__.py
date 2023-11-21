@@ -1206,9 +1206,7 @@ def run_vaevae(
             predictor_training_options=predictor_training_options,
             cuda=vamb_options.cuda,
         )
-        predictions_path = vamb_options.out_dir.joinpath(
-            "results_taxometer.csv"
-        )
+        predictions_path = vamb_options.out_dir.joinpath("results_taxometer.csv")
         column_contigs = "contigs"
         column_taxonomy = "predictions"
         delimiter_taxonomy = ","
